@@ -18,6 +18,15 @@ http://127.0.0.1:8765
 
 页面上传 PDF 后会在后台转换，完成后可下载合并后的 Markdown，也可以查看分页 Markdown 和图片。
 
+如果需要网页登录保护，在 `.env` 里配置：
+
+```text
+WEB_USERNAME=admin
+WEB_PASSWORD=换成强密码
+```
+
+配置后重启 `web_app.py`，浏览器会弹出账号密码登录框。
+
 ## 云服务器 Docker 部署
 
 服务器上推荐用 Docker Compose 跑。

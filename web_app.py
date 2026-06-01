@@ -24,6 +24,7 @@ from paddle_pdf_to_md import (
     JOB_URL,
     PaddleOcrError,
     get_token,
+    read_dotenv_value,
     request_with_retries,
     save_results,
     slugify_filename,
@@ -37,8 +38,8 @@ ROOT = Path(__file__).resolve().parent
 UPLOAD_DIR = ROOT / "uploads"
 WEB_OUTPUT_DIR = ROOT / "output" / "web"
 MAX_UPLOAD_BYTES = 1024 * 1024 * 500
-WEB_USERNAME = os.environ.get("WEB_USERNAME", "")
-WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
+WEB_USERNAME = os.environ.get("WEB_USERNAME") or read_dotenv_value("WEB_USERNAME") or ""
+WEB_PASSWORD = os.environ.get("WEB_PASSWORD") or read_dotenv_value("WEB_PASSWORD") or ""
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
