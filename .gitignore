@@ -1,0 +1,8 @@
+output/
+uploads/
+.venv/
+.env
+.tmp/
+web_app.*.log
+__pycache__/
+*.pyc
