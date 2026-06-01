@@ -18,6 +18,52 @@ http://127.0.0.1:8765
 
 页面上传 PDF 后会在后台转换，完成后可下载合并后的 Markdown，也可以查看分页 Markdown 和图片。
 
+## 云服务器 Docker 部署
+
+服务器上推荐用 Docker Compose 跑。
+
+1. 克隆仓库：
+
+```bash
+git clone https://github.com/jienigui06091/PDF-to-MD.git
+cd PDF-to-MD
+```
+
+2. 创建 `.env`：
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+至少配置：
+
+```text
+PADDLEOCR_TOKEN=你的PaddleOCR Token
+WEB_USERNAME=admin
+WEB_PASSWORD=换成强密码
+```
+
+3. 启动：
+
+```bash
+docker compose up -d --build
+```
+
+4. 浏览器访问：
+
+```text
+http://服务器IP:8765
+```
+
+输出文件会保存在服务器项目目录：
+
+```text
+output/web/
+```
+
+注意：这个网页服务能上传文件并调用你的 PaddleOCR token，云服务器上不要不设密码直接暴露公网。`WEB_USERNAME` 和 `WEB_PASSWORD` 配好后，浏览器会弹出登录框。
+
 ## 方案 A：直接用 PowerShell 运行
 
 这台机器当前没有真实可用的 Python。你可以先用 PowerShell 版本，不需要安装 `requests`：

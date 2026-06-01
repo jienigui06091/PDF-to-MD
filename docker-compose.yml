@@ -1,0 +1,15 @@
+services:
+  pdf-to-md:
+    build: .
+    container_name: pdf-to-md
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8765
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./output:/app/output
+      - ./uploads:/app/uploads

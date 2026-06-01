@@ -3,9 +3,11 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import cgi
+import base64
 import html
 import json
 import mimetypes
+import os
 import shutil
 import sys
 import threading
@@ -29,12 +31,14 @@ from paddle_pdf_to_md import (
 )
 
 
-HOST = "127.0.0.1"
-PORT = 8765
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
 UPLOAD_DIR = ROOT / "uploads"
 WEB_OUTPUT_DIR = ROOT / "output" / "web"
 MAX_UPLOAD_BYTES = 1024 * 1024 * 500
+WEB_USERNAME = os.environ.get("WEB_USERNAME", "")
+WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -453,6 +457,9 @@ class WebHandler(BaseHTTPRequestHandler):
     server_version = "PaddlePdfToMd/1.0"
 
     def do_GET(self) -> None:
+        if not self.check_auth():
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -475,10 +482,44 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if not self.check_auth():
+            return
+
         if urlparse(self.path).path != "/upload":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self.handle_upload()
+
+    def check_auth(self) -> bool:
+        if not WEB_USERNAME or not WEB_PASSWORD:
+            return True
+
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Basic "):
+            self.request_auth()
+            return False
+
+        try:
+            raw = base64.b64decode(auth_header.removeprefix("Basic ").strip()).decode(
+                "utf-8"
+            )
+        except Exception:
+            self.request_auth()
+            return False
+
+        username, separator, password = raw.partition(":")
+        if separator and username == WEB_USERNAME and password == WEB_PASSWORD:
+            return True
+
+        self.request_auth()
+        return False
+
+    def request_auth(self) -> None:
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("WWW-Authenticate", 'Basic realm="PDF to Markdown"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("Authentication required".encode("utf-8"))
 
     def handle_upload(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0") or 0)

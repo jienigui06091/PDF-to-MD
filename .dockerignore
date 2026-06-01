@@ -1,0 +1,9 @@
+.git
+.env
+.tmp
+.venv
+__pycache__
+*.pyc
+output
+uploads
+web_app.*.log
