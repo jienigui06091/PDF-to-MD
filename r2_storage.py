@@ -135,6 +135,24 @@ class R2Storage:
             Key=safe_relative_key(key),
         )
 
+    def list_objects(self, prefix: str) -> list[dict[str, Any]]:
+        clean_prefix = safe_relative_key(prefix).rstrip("/") + "/"
+        paginator = self.client.get_paginator("list_objects_v2")
+        objects = []
+        for page in paginator.paginate(
+            Bucket=self.config.bucket_name,
+            Prefix=clean_prefix,
+        ):
+            for item in page.get("Contents", []):
+                objects.append(
+                    {
+                        "key": item["Key"],
+                        "size": int(item.get("Size", 0)),
+                        "last_modified": item.get("LastModified"),
+                    }
+                )
+        return objects
+
     def public_url(self, key: str) -> str:
         if not self.config.public_base_url:
             return ""

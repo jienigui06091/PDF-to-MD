@@ -1,8 +1,9 @@
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from web_app import save_results_to_r2
+from web_app import jobs, jobs_lock, restore_jobs_from_r2, save_results_to_r2
 
 
 class FakeStorage:
@@ -16,6 +17,17 @@ class FakeStorage:
     def put_bytes(self, key: str, data: bytes, *, content_type: str):
         self.uploads[key] = (data, content_type)
         return {"key": key, "size": len(data), "content_type": content_type}
+
+
+class FakeRestoreStorage:
+    def __init__(self, objects):
+        self.config = SimpleNamespace(prefix="pdftomd")
+        self.objects = objects
+
+    def list_objects(self, prefix: str):
+        if prefix != "pdftomd/":
+            raise AssertionError(f"Unexpected prefix: {prefix}")
+        return self.objects
 
 
 class SaveResultsToR2Tests(unittest.TestCase):
@@ -59,6 +71,65 @@ class SaveResultsToR2Tests(unittest.TestCase):
             "https://files.example.com/pdf-to-md/job_document/imgs/scan.png",
             combined,
         )
+
+
+class RestoreJobsFromR2Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        with jobs_lock:
+            jobs.clear()
+
+    def tearDown(self) -> None:
+        with jobs_lock:
+            jobs.clear()
+
+    def test_completed_jobs_are_rebuilt_from_object_keys(self) -> None:
+        changed_at = datetime(2026, 7, 13, 8, 30, tzinfo=timezone.utc)
+        storage = FakeRestoreStorage(
+            [
+                {
+                    "key": "pdftomd/abc123def456_report/report.md",
+                    "size": 120,
+                    "last_modified": changed_at,
+                },
+                {
+                    "key": "pdftomd/abc123def456_report/pages/page_0001.md",
+                    "size": 80,
+                    "last_modified": changed_at,
+                },
+                {
+                    "key": "pdftomd/abc123def456_report/imgs/chart.png",
+                    "size": 256,
+                    "last_modified": changed_at,
+                },
+            ]
+        )
+
+        restored = restore_jobs_from_r2(storage)
+
+        self.assertEqual(restored, 1)
+        job = jobs["abc123def456"]
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["filename"], "report.pdf")
+        self.assertEqual(job["page_count"], 1)
+        self.assertEqual(
+            job["combined_key"], "pdftomd/abc123def456_report/report.md"
+        )
+        self.assertEqual(len(job["objects"]), 3)
+
+    def test_incomplete_prefix_is_shown_as_failed(self) -> None:
+        storage = FakeRestoreStorage(
+            [
+                {
+                    "key": "pdftomd/abc123def456_report/pages/page_0001.md",
+                    "size": 80,
+                    "last_modified": None,
+                }
+            ]
+        )
+
+        restore_jobs_from_r2(storage)
+
+        self.assertEqual(jobs["abc123def456"]["status"], "failed")
 
 
 if __name__ == "__main__":

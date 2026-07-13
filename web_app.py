@@ -6,6 +6,7 @@ import cgi
 import base64
 import html
 import json
+import mimetypes
 import os
 import shutil
 import sys
@@ -88,6 +89,104 @@ def list_jobs() -> list[Dict[str, Any]]:
             key=lambda item: item.get("created_at", ""),
             reverse=True,
         )
+
+
+def format_r2_time(value: Any) -> str:
+    if value is not None and hasattr(value, "astimezone"):
+        return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def restore_jobs_from_r2(storage: Optional[R2Storage] = None) -> int:
+    storage = storage or get_r2_storage()
+    base_prefix = storage.config.prefix.strip("/") + "/"
+    grouped: dict[str, list[dict[str, Any]]] = {}
+
+    for item in storage.list_objects(base_prefix):
+        object_key = item.get("key", "")
+        if not object_key.startswith(base_prefix):
+            continue
+        remaining = object_key[len(base_prefix) :]
+        folder, separator, relative = remaining.partition("/")
+        if not separator or not folder or not relative:
+            continue
+        grouped.setdefault(folder, []).append(
+            {
+                "key": object_key,
+                "relative": relative,
+                "size": int(item.get("size", 0)),
+                "content_type": mimetypes.guess_type(relative)[0]
+                or "application/octet-stream",
+                "last_modified": item.get("last_modified"),
+            }
+        )
+
+    restored = 0
+    for folder, folder_objects in grouped.items():
+        candidate_id, separator, output_stem = folder.partition("_")
+        if not separator or not candidate_id or not output_stem:
+            candidate_id = uuid.uuid5(uuid.NAMESPACE_URL, folder).hex[:12]
+            output_stem = folder
+
+        root_markdown = sorted(
+            (
+                item
+                for item in folder_objects
+                if "/" not in item["relative"]
+                and item["relative"].lower().endswith(".md")
+            ),
+            key=lambda item: (
+                item["relative"] != f"{output_stem}.md",
+                item["relative"].lower(),
+            ),
+        )
+        combined_item = root_markdown[0] if root_markdown else None
+        page_count = sum(
+            1
+            for item in folder_objects
+            if item["relative"].startswith("pages/")
+            and item["relative"].lower().endswith(".md")
+        )
+        timestamps = [
+            item["last_modified"]
+            for item in folder_objects
+            if item.get("last_modified") is not None
+        ]
+        created_at = format_r2_time(min(timestamps) if timestamps else None)
+        updated_at = format_r2_time(max(timestamps) if timestamps else None)
+        public_objects = [
+            {key: value for key, value in item.items() if key != "last_modified"}
+            for item in sorted(
+                folder_objects, key=lambda item: item["relative"].lower()
+            )
+        ]
+        status = "done" if combined_item else "failed"
+        message = (
+            "Restored from R2"
+            if combined_item
+            else "Restored from R2, but combined Markdown is missing"
+        )
+        restored_job = {
+            "id": candidate_id,
+            "filename": f"{output_stem}.pdf",
+            "status": status,
+            "message": message,
+            "r2_prefix": f"{base_prefix}{folder}",
+            "combined_name": combined_item["relative"] if combined_item else "",
+            "combined_key": combined_item["key"] if combined_item else "",
+            "page_count": page_count,
+            "total_pages": page_count,
+            "extracted_pages": page_count,
+            "objects": public_objects,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+        with jobs_lock:
+            if candidate_id not in jobs:
+                jobs[candidate_id] = restored_job
+                restored += 1
+
+    return restored
 
 
 def format_size(size: int) -> str:
@@ -889,6 +988,15 @@ class WebHandler(BaseHTTPRequestHandler):
 
 def main() -> int:
     print(f"Starting PDF to Markdown web app in {ROOT}", flush=True)
+    try:
+        restored_count = restore_jobs_from_r2()
+        print(
+            f"Restored {restored_count} job(s) from R2 prefix "
+            f"{get_r2_storage().config.prefix}/",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"Unable to restore jobs from R2: {exc}", flush=True)
     server = ThreadingHTTPServer((HOST, PORT), WebHandler)
     print(f"PDF to Markdown web app running at http://{HOST}:{PORT}", flush=True)
     print("Press Ctrl+C to stop.", flush=True)
