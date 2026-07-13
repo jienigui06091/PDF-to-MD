@@ -79,7 +79,7 @@ output/web/
 
 ```powershell
 $env:PADDLEOCR_TOKEN="你的PaddleOCR Token"
-.\paddle_pdf_to_md.ps1 "C:\Users\Admin\Desktop\查理九世\22•所罗们王的魔戒.pdf" -OutputDir ".\output\charlie22"
+.\paddle_pdf_to_md.ps1 "C:\yourpath\xxxx.pdf" -OutputDir ".\output\charlie22"
 ```
 
 如果 PowerShell 拦截脚本执行，先在当前窗口临时放开：
@@ -95,13 +95,13 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 当前机器可用的 Python 是：
 
 ```powershell
-C:\Users\Admin\AppData\Local\Programs\Python\Python312\python.exe
+C:\yourpath\python.exe
 ```
 
 如果 `python` 命令仍然指向 Windows Store 占位符，就先用完整路径执行：
 
 ```powershell
-& "C:\Users\Admin\AppData\Local\Programs\Python\Python312\python.exe" -m pip install --user -r requirements.txt
+& "C:\yourpath\python.exe" -m pip install --user -r requirements.txt
 ```
 
 ### 2. 配置 Token
@@ -123,14 +123,14 @@ $env:PADDLEOCR_TOKEN="你的PaddleOCR Token"
 ### 3. 转换你的 PDF
 
 ```powershell
-& "C:\Users\Admin\AppData\Local\Programs\Python\Python312\python.exe" .\paddle_pdf_to_md.py "C:\Users\Admin\Desktop\查理九世\22•所罗们王的魔戒.pdf" --output-dir ".\output\charlie22"
+& "C:\yourpath\python.exe" .\paddle_pdf_to_md.py "C:\yourpath\xxx.pdf" --output-dir ".\output\charlie22"
 ```
 
 输出内容：
 
 ```text
 output\charlie22\
-  22•所罗们王的魔戒.md
+  xxx.md
   pages\
     page_0001.md
     page_0002.md
@@ -158,5 +158,5 @@ PaddleOCR Markdown 里引用的图片会按接口返回的相对路径保存到�
 完整示例：
 
 ```powershell
-& "C:\Users\Admin\AppData\Local\Programs\Python\Python312\python.exe" .\paddle_pdf_to_md.py "C:\Users\Admin\Desktop\查理九世\22•所罗们王的魔戒.pdf" --output-dir ".\output\charlie22" --doc-orientation
+& "C:\yourpath\python.exe" .\paddle_pdf_to_md.py "C:\yourpath\xxx.pdf" --output-dir ".\output\charlie22" --doc-orientation
 ```
