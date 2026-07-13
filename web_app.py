@@ -6,37 +6,36 @@ import cgi
 import base64
 import html
 import json
-import mimetypes
 import os
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from paddle_pdf_to_md import (
     DEFAULT_MODEL,
     JOB_URL,
     PaddleOcrError,
     get_token,
+    iter_jsonl_results,
     read_dotenv_value,
     request_with_retries,
-    save_results,
     slugify_filename,
     submit_job,
 )
+from r2_storage import R2Config, R2Storage, R2StorageError, join_key, safe_relative_key
 
 
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
-UPLOAD_DIR = ROOT / "uploads"
-WEB_OUTPUT_DIR = ROOT / "output" / "web"
 MAX_UPLOAD_BYTES = 1024 * 1024 * 500
 WEB_USERNAME = os.environ.get("WEB_USERNAME") or read_dotenv_value("WEB_USERNAME") or ""
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD") or read_dotenv_value("WEB_PASSWORD") or ""
@@ -49,6 +48,24 @@ if hasattr(sys.stderr, "reconfigure"):
 
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = threading.Lock()
+r2_lock = threading.Lock()
+r2_storage: Optional[R2Storage] = None
+
+
+def get_r2_storage() -> R2Storage:
+    global r2_storage
+    with r2_lock:
+        if r2_storage is None:
+            r2_storage = R2Storage(R2Config.from_environment(read_dotenv_value))
+        return r2_storage
+
+
+def get_r2_configuration_error() -> str:
+    try:
+        R2Config.from_environment(read_dotenv_value)
+    except R2StorageError as exc:
+        return str(exc)
+    return ""
 
 
 def update_job(job_id: str, **values: Any) -> None:
@@ -119,19 +136,93 @@ def poll_paddle_result_url(job_id: str, token: str, paddle_job_id: str) -> str:
         time.sleep(5)
 
 
+def download_resource(url: str) -> tuple[bytes, str]:
+    response = request_with_retries("GET", url, timeout=180)
+    try:
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        return response.content, content_type
+    finally:
+        response.close()
+
+
+def save_results_to_r2(
+    jsonl_url: str,
+    storage: R2Storage,
+    object_prefix: str,
+    combined_name: str,
+) -> tuple[int, list[dict[str, Any]], str]:
+    objects: dict[str, dict[str, Any]] = {}
+    combined_parts: list[str] = []
+    page_num = 1
+
+    def upload(relative_path: str, data: bytes, content_type: str) -> None:
+        relative_key = safe_relative_key(relative_path)
+        object_key = join_key(object_prefix, relative_key)
+        uploaded = storage.put_bytes(object_key, data, content_type=content_type)
+        objects[relative_key] = {**uploaded, "relative": relative_key}
+
+    for item in iter_jsonl_results(jsonl_url):
+        result = item.get("result") or {}
+        layout_results = result.get("layoutParsingResults") or []
+
+        for layout_result in layout_results:
+            markdown = layout_result.get("markdown") or {}
+            md_text = markdown.get("text") or ""
+
+            images = markdown.get("images") or {}
+            for image_path, image_url in images.items():
+                relative_key = safe_relative_key(image_path)
+                object_key = join_key(object_prefix, relative_key)
+                markdown_url = storage.public_url(object_key) or relative_key
+                if image_path != markdown_url:
+                    md_text = md_text.replace(image_path, markdown_url)
+                if relative_key not in objects:
+                    image_data, content_type = download_resource(image_url)
+                    upload(relative_key, image_data, content_type)
+
+            page_relative = f"pages/page_{page_num:04d}.md"
+            upload(page_relative, md_text.encode("utf-8"), "text/markdown; charset=utf-8")
+
+            combined_parts.append(f"\n\n<!-- page {page_num} -->\n\n")
+            combined_parts.append(md_text.rstrip())
+            combined_parts.append("\n")
+
+            output_images = layout_result.get("outputImages") or {}
+            for image_name, image_url in output_images.items():
+                safe_name = slugify_filename(f"{image_name}_{page_num:04d}.jpg")
+                relative_key = f"output_images/{safe_name}"
+                image_data, content_type = download_resource(image_url)
+                upload(relative_key, image_data, content_type)
+
+            print(f"Uploaded page {page_num} to R2: {page_relative}")
+            page_num += 1
+
+    if page_num == 1:
+        raise PaddleOcrError("No layoutParsingResults found in OCR result")
+
+    combined_relative = safe_relative_key(combined_name)
+    upload(
+        combined_relative,
+        "".join(combined_parts).encode("utf-8"),
+        "text/markdown; charset=utf-8",
+    )
+    manifest = sorted(objects.values(), key=lambda item: item["relative"].lower())
+    return page_num - 1, manifest, join_key(object_prefix, combined_relative)
+
+
 def run_conversion(job_id: str) -> None:
     job = get_job(job_id)
     if not job:
         return
 
+    input_path = Path(job["input_path"])
     try:
         token = get_token()
         if not token:
             raise PaddleOcrError("Missing PADDLEOCR_TOKEN in .env or environment")
 
-        input_path = Path(job["input_path"])
-        output_dir = Path(job["output_dir"])
-        combined_md = Path(job["combined_md"])
+        storage = get_r2_storage()
         optional_payload = {
             "useDocOrientationClassify": bool(job.get("doc_orientation")),
             "useDocUnwarping": bool(job.get("doc_unwarping")),
@@ -139,7 +230,12 @@ def run_conversion(job_id: str) -> None:
         }
 
         update_job(job_id, status="submitting", message="Uploading PDF to PaddleOCR")
-        paddle_job_id = submit_job(str(input_path), token, DEFAULT_MODEL, optional_payload)
+        try:
+            paddle_job_id = submit_job(
+                str(input_path), token, DEFAULT_MODEL, optional_payload
+            )
+        finally:
+            input_path.unlink(missing_ok=True)
         update_job(
             job_id,
             status="running",
@@ -148,30 +244,42 @@ def run_conversion(job_id: str) -> None:
         )
 
         jsonl_url = poll_paddle_result_url(job_id, token, paddle_job_id)
-        update_job(job_id, status="saving", message="Saving Markdown and images")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        combined_md.parent.mkdir(parents=True, exist_ok=True)
-        save_results(jsonl_url, output_dir, combined_md)
-
-        page_count = len(list((output_dir / "pages").glob("*.md")))
+        update_job(job_id, status="saving", message="Uploading Markdown and images to R2")
+        page_count, objects, combined_key = save_results_to_r2(
+            jsonl_url,
+            storage,
+            job["r2_prefix"],
+            job["combined_name"],
+        )
         update_job(
             job_id,
             status="done",
-            message="Conversion completed",
+            message="Conversion completed and uploaded to R2",
             page_count=page_count,
+            objects=objects,
+            combined_key=combined_key,
         )
     except Exception as exc:
         update_job(job_id, status="failed", message=str(exc), error=repr(exc))
+    finally:
+        input_path.unlink(missing_ok=True)
 
 
 def render_page(title: str, body: str) -> bytes:
-    token_notice = ""
+    notices = []
     if not get_token():
-        token_notice = """
+        notices.append("""
         <div class="notice error">
           未检测到 <code>PADDLEOCR_TOKEN</code>。请先在项目根目录的 <code>.env</code> 里配置。
         </div>
-        """
+        """)
+    r2_error = get_r2_configuration_error()
+    if r2_error:
+        notices.append(f"""
+        <div class="notice error">
+          {html.escape(r2_error)}。请先配置 R2 后再上传文件。
+        </div>
+        """)
 
     page = f"""<!doctype html>
 <html lang="zh-CN">
@@ -336,7 +444,7 @@ def render_page(title: str, body: str) -> bytes:
 <body>
   <header><h1>PDF 转 Markdown</h1></header>
   <main>
-    {token_notice}
+    {''.join(notices)}
     {body}
   </main>
 </body>
@@ -523,9 +631,19 @@ class WebHandler(BaseHTTPRequestHandler):
         self.wfile.write("Authentication required".encode("utf-8"))
 
     def handle_upload(self) -> None:
-        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
+            return
         if content_length <= 0 or content_length > MAX_UPLOAD_BYTES:
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+
+        try:
+            storage = get_r2_storage()
+        except R2StorageError as exc:
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
             return
 
         form = cgi.FieldStorage(
@@ -543,21 +661,27 @@ class WebHandler(BaseHTTPRequestHandler):
             return
 
         original_name = Path(file_field.filename).name
-        safe_name = slugify_filename(original_name)
-        if not safe_name.lower().endswith(".pdf"):
-            safe_name += ".pdf"
-
         display_name = form.getfirst("name", "").strip()
         output_stem = slugify_filename(display_name or Path(original_name).stem)
         job_id = uuid.uuid4().hex[:12]
         created_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        upload_path = UPLOAD_DIR / f"{job_id}_{safe_name}"
-        output_dir = WEB_OUTPUT_DIR / f"{job_id}_{output_stem}"
-        combined_md = output_dir / f"{output_stem}.md"
+        object_prefix = f"{storage.config.prefix}/{job_id}_{output_stem}"
 
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        with upload_path.open("wb") as output:
-            shutil.copyfileobj(file_field.file, output)
+        upload_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f"pdf-to-md-{job_id}-",
+                suffix=".pdf",
+                delete=False,
+            ) as output:
+                upload_path = Path(output.name)
+                shutil.copyfileobj(file_field.file, output)
+                input_size = output.tell()
+        except Exception:
+            if upload_path:
+                upload_path.unlink(missing_ok=True)
+            raise
 
         with jobs_lock:
             jobs[job_id] = {
@@ -566,9 +690,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 "status": "queued",
                 "message": "Queued",
                 "input_path": str(upload_path),
-                "input_size": upload_path.stat().st_size,
-                "output_dir": str(output_dir),
-                "combined_md": str(combined_md),
+                "input_size": input_size,
+                "r2_prefix": object_prefix,
+                "combined_name": f"{output_stem}.md",
                 "doc_orientation": "doc_orientation" in form,
                 "doc_unwarping": "doc_unwarping" in form,
                 "chart_recognition": "chart_recognition" in form,
@@ -577,7 +701,14 @@ class WebHandler(BaseHTTPRequestHandler):
             }
 
         thread = threading.Thread(target=run_conversion, args=(job_id,), daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            upload_path.unlink(missing_ok=True)
+            with jobs_lock:
+                jobs.pop(job_id, None)
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Unable to start job")
+            return
 
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", f"/job/{job_id}")
@@ -602,8 +733,8 @@ class WebHandler(BaseHTTPRequestHandler):
             if key
             not in {
                 "input_path",
-                "output_dir",
-                "combined_md",
+                "objects",
+                "combined_key",
                 "error",
             }
         }
@@ -620,19 +751,59 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
-        file_path = Path(job["combined_md"])
-        if not file_path.exists():
+        combined_key = job.get("combined_key")
+        combined_item = next(
+            (
+                item
+                for item in job.get("objects", [])
+                if item.get("key") == combined_key
+            ),
+            None,
+        )
+        if not combined_item:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+        self.send_r2_object(combined_item, attachment=True)
 
-        data = file_path.read_bytes()
-        filename = file_path.name.encode("utf-8", "ignore").decode("utf-8")
+    def send_r2_object(self, item: Dict[str, Any], *, attachment: bool = False) -> None:
+        try:
+            result = get_r2_storage().get_object(item["key"])
+        except Exception as exc:
+            print(f"R2 download failed for {item.get('key')}: {exc}")
+            self.send_error(HTTPStatus.BAD_GATEWAY, "Unable to read object from R2")
+            return
+
+        body = result["Body"]
+        content_type = result.get("ContentType") or item.get(
+            "content_type", "application/octet-stream"
+        )
+        if content_type.startswith("text/") and "charset=" not in content_type:
+            content_type += "; charset=utf-8"
+        content_length = result.get("ContentLength", item.get("size"))
+
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/markdown; charset=utf-8")
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Type", content_type)
+        if content_length is not None:
+            self.send_header("Content-Length", str(content_length))
+        if attachment:
+            filename = PurePosixPath(item["relative"]).name
+            ascii_name = "".join(
+                char for char in filename if ord(char) < 128 and char not in '"\\'
+            ) or "document.md"
+            disposition = (
+                f'attachment; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+            self.send_header("Content-Disposition", disposition)
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            while True:
+                chunk = body.read(1024 * 128)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        finally:
+            body.close()
 
     def send_file_or_listing(self, request_path: str) -> None:
         parts = request_path.split("/", 3)
@@ -641,61 +812,82 @@ class WebHandler(BaseHTTPRequestHandler):
             return
 
         job_id = parts[2]
-        rel_path = parts[3] if len(parts) > 3 else ""
+        rel_path = unquote(parts[3]) if len(parts) > 3 else ""
         job = get_job(job_id)
         if not job or job.get("status") != "done":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
-        root = Path(job["output_dir"]).resolve()
-        target = (root / rel_path).resolve()
-        if root != target and root not in target.parents:
+        normalized = rel_path.replace("\\", "/").strip("/")
+        rel_parts = PurePosixPath(normalized).parts if normalized else ()
+        if ".." in rel_parts:
             self.send_error(HTTPStatus.FORBIDDEN)
             return
-        if not target.exists():
+
+        objects = job.get("objects", [])
+        target_item = next(
+            (item for item in objects if item.get("relative") == normalized), None
+        )
+        if target_item:
+            self.send_r2_object(target_item)
+            return
+
+        directory_prefix = f"{normalized}/" if normalized else ""
+        entries: dict[str, dict[str, Any]] = {}
+        for item in objects:
+            relative = item.get("relative", "")
+            if not relative.startswith(directory_prefix):
+                continue
+            remainder = relative[len(directory_prefix) :]
+            if not remainder:
+                continue
+            name, separator, _ = remainder.partition("/")
+            if separator:
+                entries[name] = {"is_dir": True}
+            elif name not in entries:
+                entries[name] = {"is_dir": False, "item": item}
+
+        if not entries and normalized:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
-        if target.is_dir():
-            rows = []
-            if target != root:
-                parent = Path(rel_path).parent.as_posix()
-                rows.append(f'<li><a href="/files/{job_id}/{html.escape(parent)}">..</a></li>')
-            for child in sorted(target.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
-                child_rel = child.relative_to(root).as_posix()
-                label = child.name + ("/" if child.is_dir() else "")
-                size = "" if child.is_dir() else f" <span class='muted'>{format_size(child.stat().st_size)}</span>"
-                rows.append(
-                    f'<li><a href="/files/{job_id}/{html.escape(child_rel)}">{html.escape(label)}</a>{size}</li>'
+        rows = []
+        if normalized:
+            parent = PurePosixPath(normalized).parent.as_posix()
+            parent = "" if parent == "." else parent
+            rows.append(
+                f'<li><a href="/files/{job_id}/{quote(parent, safe="/")}">..</a></li>'
+            )
+        for name, entry in sorted(
+            entries.items(), key=lambda pair: (not pair[1]["is_dir"], pair[0].lower())
+        ):
+            child_relative = f"{directory_prefix}{name}"
+            label = name + ("/" if entry["is_dir"] else "")
+            size = ""
+            if not entry["is_dir"]:
+                size = (
+                    " <span class='muted'>"
+                    f"{format_size(int(entry['item'].get('size', 0)))}</span>"
                 )
-            body = f"""
-            <section class="panel">
-              <h2>输出文件</h2>
-              <p class="muted"><code>{html.escape(str(root))}</code></p>
-              <ul>{''.join(rows)}</ul>
-            </section>
-            <p><a class="button secondary" href="/job/{job_id}">返回任务</a></p>
-            """
-            self.send_html(render_page("输出文件", body))
-            return
-
-        data = target.read_bytes()
-        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        if content_type.startswith("text/") or target.suffix.lower() == ".md":
-            content_type += "; charset=utf-8"
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+            rows.append(
+                f'<li><a href="/files/{job_id}/{quote(child_relative, safe="/")}">'
+                f"{html.escape(label)}</a>{size}</li>"
+            )
+        body = f"""
+        <section class="panel">
+          <h2>R2 输出文件</h2>
+          <p class="muted"><code>{html.escape(job.get('r2_prefix', ''))}</code></p>
+          <ul>{''.join(rows)}</ul>
+        </section>
+        <p><a class="button secondary" href="/job/{job_id}">返回任务</a></p>
+        """
+        self.send_html(render_page("R2 输出文件", body))
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}")
 
 
 def main() -> int:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    WEB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Starting PDF to Markdown web app in {ROOT}", flush=True)
     server = ThreadingHTTPServer((HOST, PORT), WebHandler)
     print(f"PDF to Markdown web app running at http://{HOST}:{PORT}", flush=True)

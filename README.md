@@ -16,16 +16,36 @@
 http://127.0.0.1:8765
 ```
 
-页面上传 PDF 后会在后台转换，完成后可下载合并后的 Markdown，也可以查看分页 Markdown 和图片。
+页面上传 PDF 后会在后台转换，完成后可下载合并后的 Markdown，也可以查看分页 Markdown 和图片。网页转换产生的 Markdown、分页文件和图片会直接上传到 Cloudflare R2，不会写入本地输出目录。上传的原始 PDF 仅在系统临时目录中停留到 PaddleOCR 接收完成，之后立即删除。
 
-如果需要网页登录保护，在 `.env` 里配置：
+在 `.env` 里配置 PaddleOCR、R2 和网页登录信息：
 
 ```text
+PADDLEOCR_TOKEN=你的PaddleOCR Token
+
 WEB_USERNAME=admin
 WEB_PASSWORD=换成强密码
+
+R2_ACCOUNT_ID=你的Cloudflare账户ID
+R2_ACCESS_KEY_ID=你的R2访问密钥ID
+R2_SECRET_ACCESS_KEY=你的R2私钥
+R2_BUCKET_NAME=你的R2桶名
+R2_PREFIX=pdf-to-md
 ```
 
-配置后重启 `web_app.py`，浏览器会弹出账号密码登录框。
+也可以用完整的 `R2_ENDPOINT_URL` 代替 `R2_ACCOUNT_ID`：
+
+```text
+R2_ENDPOINT_URL=https://你的账户ID.r2.cloudflarestorage.com
+```
+
+R2 API Token 至少需要目标桶的“对象读取”和“对象写入”权限。R2 桶可以保持私有，网页会从 R2 代理下载和文件查看。如果桶配置了公开域名，可额外设置：
+
+```text
+R2_PUBLIC_BASE_URL=https://files.example.com
+```
+
+设置后，生成的 Markdown 内图片链接会直接指向公开 R2 地址。配置完成后重启 `web_app.py`；设置了网页账号密码时，浏览器会弹出登录框。
 
 ## 云服务器 Docker 部署
 
@@ -51,6 +71,10 @@ nano .env
 PADDLEOCR_TOKEN=你的PaddleOCR Token
 WEB_USERNAME=admin
 WEB_PASSWORD=换成强密码
+R2_ACCOUNT_ID=你的Cloudflare账户ID
+R2_ACCESS_KEY_ID=你的R2访问密钥ID
+R2_SECRET_ACCESS_KEY=你的R2私钥
+R2_BUCKET_NAME=你的R2桶名
 ```
 
 3. 启动：
@@ -65,13 +89,13 @@ docker compose up -d --build
 http://服务器IP:8765
 ```
 
-输出文件会保存在服务器项目目录：
+网页转换产物会保存在 R2 的以下对象前缀：
 
 ```text
-output/web/
+pdf-to-md/<任务ID>_<文件名>/
 ```
 
-注意：这个网页服务能上传文件并调用你的 PaddleOCR token，云服务器上不要不设密码直接暴露公网。`WEB_USERNAME` 和 `WEB_PASSWORD` 配好后，浏览器会弹出登录框。
+Docker Compose 不再挂载本地 `output/` 和 `uploads/` 目录。注意：这个网页服务能上传文件并调用你的 PaddleOCR token，云服务器上不要不设密码直接暴露公网。`WEB_USERNAME` 和 `WEB_PASSWORD` 配好后，浏览器会弹出登录框。
 
 ## 方案 A：直接用 PowerShell 运行
 

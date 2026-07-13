@@ -10,6 +10,3 @@ services:
       PORT: 8765
     ports:
       - "8765:8765"
-    volumes:
-      - ./output:/app/output
-      - ./uploads:/app/uploads
