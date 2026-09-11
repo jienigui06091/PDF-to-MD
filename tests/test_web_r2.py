@@ -2,7 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from web_app import save_results_to_r2
+from paddle_pdf_to_md import DEFAULT_MODEL, DOCUMENT_PARSING_MODELS
+from web_app import get_document_parsing_models, save_results_to_r2
 
 
 class FakeStorage:
@@ -59,6 +60,15 @@ class SaveResultsToR2Tests(unittest.TestCase):
             "https://files.example.com/pdf-to-md/job_document/imgs/scan.png",
             combined,
         )
+
+
+class DocumentParsingModelsTests(unittest.TestCase):
+    def test_model_options_include_the_default_and_supported_models(self) -> None:
+        models = get_document_parsing_models()
+
+        self.assertEqual([model["id"] for model in models], list(DOCUMENT_PARSING_MODELS))
+        self.assertEqual(models[0]["id"], DEFAULT_MODEL)
+        self.assertTrue(models[0]["label"].endswith("(recommended)"))
 
 
 if __name__ == "__main__":

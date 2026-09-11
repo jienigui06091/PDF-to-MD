@@ -12,6 +12,12 @@ import requests
 
 JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 DEFAULT_MODEL = "PaddleOCR-VL-1.6"
+DOCUMENT_PARSING_MODELS = (
+    "PaddleOCR-VL-1.6",
+    "PaddleOCR-VL-1.5",
+    "PaddleOCR-VL",
+    "PP-StructureV3",
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
