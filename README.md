@@ -49,6 +49,12 @@ R2_PUBLIC_BASE_URL=https://files.example.com
 
 设置后，生成的 Markdown 内图片链接会直接指向公开 R2 地址。配置完成后重启 `web_app.py`；设置了网页账号密码时，浏览器会弹出登录框。
 
+网页服务每次启动时会扫描 `R2_PREFIX`（默认 `pdf-to-md/`）下的一级任务目录，并从 R2 对象键恢复历史任务、分页数和文件列表。因此容器重启不会再清空页面中的已完成任务。目录结构应保持为：
+
+```text
+<R2_PREFIX>/<任务ID>_<文件名>/
+```
+
 ## 云服务器 Docker 部署
 
 服务器上推荐用 Docker Compose 跑。
