@@ -21,10 +21,9 @@ from typing import Any, Dict, Optional
 from urllib.parse import quote, unquote, urlparse
 
 from paddle_pdf_to_md import (
-    DEFAULT_MODEL,
-    DOCUMENT_PARSING_MODELS,
     JOB_URL,
     PaddleOcrError,
+    get_model,
     get_token,
     iter_jsonl_results,
     read_dotenv_value,
@@ -68,16 +67,6 @@ def get_r2_configuration_error() -> str:
     except R2StorageError as exc:
         return str(exc)
     return ""
-
-
-def get_document_parsing_models() -> list[dict[str, str]]:
-    return [
-        {
-            "id": model,
-            "label": f"{model}{' (recommended)' if model == DEFAULT_MODEL else ''}",
-        }
-        for model in DOCUMENT_PARSING_MODELS
-    ]
 
 
 def update_job(job_id: str, **values: Any) -> None:
@@ -328,9 +317,9 @@ def run_conversion(job_id: str) -> None:
 
     input_path = Path(job["input_path"])
     try:
-        token = job.get("token") or get_token()
+        token = get_token()
         if not token:
-            raise PaddleOcrError("Missing PaddleOCR API key")
+            raise PaddleOcrError("Missing PaddleOCR token configuration")
 
         storage = get_r2_storage()
         optional_payload = {
@@ -344,7 +333,7 @@ def run_conversion(job_id: str) -> None:
             paddle_job_id = submit_job(
                 str(input_path),
                 token,
-                job.get("model", DEFAULT_MODEL),
+                job["model"],
                 optional_payload,
             )
         finally:
@@ -376,10 +365,6 @@ def run_conversion(job_id: str) -> None:
         update_job(job_id, status="failed", message=str(exc), error=repr(exc))
     finally:
         input_path.unlink(missing_ok=True)
-        with jobs_lock:
-            current_job = jobs.get(job_id)
-            if current_job:
-                current_job.pop("token", None)
 
 
 def render_page(title: str, body: str) -> bytes:
@@ -507,17 +492,6 @@ def render_page(title: str, body: str) -> bytes:
       color: #1f2937;
       border-color: var(--line);
     }}
-    .field-action {{
-      display: flex;
-      align-items: end;
-      gap: 10px;
-    }}
-    .field-action > div {{
-      flex: 1 1 auto;
-    }}
-    .field-action button {{
-      flex: 0 0 auto;
-    }}
     .notice {{
       border-radius: 6px;
       padding: 10px 12px;
@@ -608,21 +582,6 @@ def render_home() -> bytes:
     <section class="panel">
       <h2>上传 PDF</h2>
       <form id="upload-form" method="post" action="/upload" enctype="multipart/form-data">
-        <div class="row">
-          <div class="field-action">
-            <div>
-              <label for="api-key">PaddleOCR API Key</label>
-              <input id="api-key" name="api_key" type="password" autocomplete="off" required>
-            </div>
-            <button id="load-models" type="button">获取模型</button>
-          </div>
-          <div>
-            <label for="model">模型</label>
-            <select id="model" name="model" required disabled>
-              <option value="">填写 API Key 后获取模型</option>
-            </select>
-          </div>
-        </div>
         <label for="pdf">选择 PDF 文件</label>
         <input id="pdf" name="pdf" type="file" accept="application/pdf,.pdf" required>
         <div class="row" style="margin-top:14px">
@@ -643,57 +602,6 @@ def render_home() -> bytes:
       <h2>任务</h2>
       {jobs_table}
     </section>
-    <script>
-      const apiKeyInput = document.getElementById('api-key');
-      const modelSelect = document.getElementById('model');
-      const loadModelsButton = document.getElementById('load-models');
-
-      function setModelOptions(models) {{
-        modelSelect.replaceChildren();
-        for (const model of models) {{
-          const option = document.createElement('option');
-          option.value = model.id;
-          option.textContent = model.label;
-          modelSelect.appendChild(option);
-        }}
-        modelSelect.disabled = models.length === 0;
-      }}
-
-      async function loadModels() {{
-        const apiKey = apiKeyInput.value.trim();
-        if (!apiKey) {{
-          apiKeyInput.focus();
-          return;
-        }}
-        loadModelsButton.disabled = true;
-        try {{
-          const response = await fetch('/api/models', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{api_key: apiKey}}),
-          }});
-          const body = await response.json();
-          if (!response.ok) {{
-            throw new Error(body.error || '获取模型失败');
-          }}
-          setModelOptions(body.models || []);
-        }} catch (error) {{
-          setModelOptions([]);
-          alert(error.message || '获取模型失败');
-        }} finally {{
-          loadModelsButton.disabled = false;
-        }}
-      }}
-
-      loadModelsButton.addEventListener('click', loadModels);
-      apiKeyInput.addEventListener('input', () => setModelOptions([]));
-      document.getElementById('upload-form').addEventListener('submit', (event) => {{
-        if (modelSelect.disabled || !modelSelect.value) {{
-          event.preventDefault();
-          loadModels();
-        }}
-      }});
-    </script>
     """
     return render_page("PDF 转 Markdown", body)
 
@@ -789,9 +697,6 @@ class WebHandler(BaseHTTPRequestHandler):
             return
 
         path = urlparse(self.path).path
-        if path == "/api/models":
-            self.handle_models()
-            return
         if path != "/upload":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -860,14 +765,13 @@ class WebHandler(BaseHTTPRequestHandler):
 
         original_name = Path(file_field.filename).name
         display_name = form.getfirst("name", "").strip()
-        api_key = form.getfirst("api_key", "").strip()
-        model = form.getfirst("model", "").strip()
-        if not api_key:
-            self.send_error(HTTPStatus.BAD_REQUEST, "Missing PaddleOCR API key")
+        if not get_token():
+            self.send_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Missing PaddleOCR token configuration",
+            )
             return
-        if model not in DOCUMENT_PARSING_MODELS:
-            self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported PaddleOCR model")
-            return
+        model = get_model()
         output_stem = slugify_filename(display_name or Path(original_name).stem)
         job_id = uuid.uuid4().hex[:12]
         created_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -897,7 +801,6 @@ class WebHandler(BaseHTTPRequestHandler):
                 "message": "Queued",
                 "input_path": str(upload_path),
                 "input_size": input_size,
-                "token": api_key,
                 "model": model,
                 "r2_prefix": object_prefix,
                 "combined_name": f"{output_stem}.md",
@@ -922,41 +825,6 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Location", f"/job/{job_id}")
         self.end_headers()
 
-    def handle_models(self) -> None:
-        try:
-            content_length = int(self.headers.get("Content-Length", "0") or 0)
-        except ValueError:
-            self.send_json({"error": "Invalid Content-Length"}, HTTPStatus.BAD_REQUEST)
-            return
-        if content_length <= 0 or content_length > 16 * 1024:
-            self.send_json({"error": "Invalid request body"}, HTTPStatus.BAD_REQUEST)
-            return
-
-        try:
-            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self.send_json({"error": "Invalid JSON body"}, HTTPStatus.BAD_REQUEST)
-            return
-
-        if not isinstance(payload, dict):
-            self.send_json({"error": "Invalid JSON body"}, HTTPStatus.BAD_REQUEST)
-            return
-
-        api_key = payload.get("api_key")
-        if not isinstance(api_key, str):
-            self.send_json(
-                {"error": "Missing PaddleOCR API key"}, HTTPStatus.BAD_REQUEST
-            )
-            return
-        api_key = api_key.strip()
-        if not api_key:
-            self.send_json(
-                {"error": "Missing PaddleOCR API key"}, HTTPStatus.BAD_REQUEST
-            )
-            return
-
-        self.send_json({"models": get_document_parsing_models()})
-
     def send_html(self, body: bytes) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -976,7 +844,6 @@ class WebHandler(BaseHTTPRequestHandler):
             if key
             not in {
                 "input_path",
-                "token",
                 "objects",
                 "combined_key",
                 "error",

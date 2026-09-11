@@ -3,11 +3,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from paddle_pdf_to_md import DEFAULT_MODEL, DOCUMENT_PARSING_MODELS
+from paddle_pdf_to_md import get_model
 from web_app import (
-    get_document_parsing_models,
     jobs,
     jobs_lock,
+    render_home,
     restore_jobs_from_r2,
     save_results_to_r2,
 )
@@ -80,13 +80,17 @@ class SaveResultsToR2Tests(unittest.TestCase):
         )
 
 
-class DocumentParsingModelsTests(unittest.TestCase):
-    def test_model_options_include_the_default_and_supported_models(self) -> None:
-        models = get_document_parsing_models()
+class PaddleOcrConfigurationTests(unittest.TestCase):
+    def test_model_uses_environment_configuration(self) -> None:
+        with patch.dict("os.environ", {"PADDLEOCR_MODEL": "custom-model"}):
+            self.assertEqual(get_model(), "custom-model")
 
-        self.assertEqual([model["id"] for model in models], list(DOCUMENT_PARSING_MODELS))
-        self.assertEqual(models[0]["id"], DEFAULT_MODEL)
-        self.assertTrue(models[0]["label"].endswith("(recommended)"))
+    def test_home_does_not_expose_api_key_or_model_endpoint(self) -> None:
+        page = render_home().decode("utf-8")
+
+        self.assertNotIn('name="api_key"', page)
+        self.assertNotIn('name="model"', page)
+        self.assertNotIn("/api/models", page)
 
 
 class RestoreJobsFromR2Tests(unittest.TestCase):

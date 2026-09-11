@@ -12,12 +12,6 @@ import requests
 
 JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 DEFAULT_MODEL = "PaddleOCR-VL-1.6"
-DOCUMENT_PARSING_MODELS = (
-    "PaddleOCR-VL-1.6",
-    "PaddleOCR-VL-1.5",
-    "PaddleOCR-VL",
-    "PP-StructureV3",
-)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -46,6 +40,14 @@ def read_dotenv_value(name: str) -> Optional[str]:
 
 def get_token() -> Optional[str]:
     return os.environ.get("PADDLEOCR_TOKEN") or read_dotenv_value("PADDLEOCR_TOKEN")
+
+
+def get_model() -> str:
+    return (
+        os.environ.get("PADDLEOCR_MODEL")
+        or read_dotenv_value("PADDLEOCR_MODEL")
+        or DEFAULT_MODEL
+    )
 
 
 def request_with_retries(
@@ -287,7 +289,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Combined Markdown path. Default: <output-dir>/<input-name>.md",
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Default: {DEFAULT_MODEL}")
     parser.add_argument(
         "--job-id",
         default=None,
@@ -350,7 +351,7 @@ def main() -> int:
             print(f"Reusing job: {job_id}")
         else:
             print(f"Submitting job: {args.input}")
-            job_id = submit_job(args.input, token, args.model, optional_payload)
+            job_id = submit_job(args.input, token, get_model(), optional_payload)
             print(f"Job submitted: {job_id}")
 
         jsonl_url = wait_for_result_url(

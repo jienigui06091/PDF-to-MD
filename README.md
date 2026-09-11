@@ -18,12 +18,11 @@ http://127.0.0.1:8765
 
 页面上传 PDF 后会在后台转换，完成后可下载合并后的 Markdown，也可以查看分页 Markdown 和图片。网页转换产生的 Markdown、分页文件和图片会直接上传到 Cloudflare R2，不会写入本地输出目录。上传的原始 PDF 仅在系统临时目录中停留到 PaddleOCR 接收完成，之后立即删除。
 
-网页转换时，在上传区填写 PaddleOCR API Key，点击“获取模型”后选择文档解析模型。该 Key 仅保存在当前内存任务中，任务完成或失败后会清除，不会写入 `.env`、R2 或任务查询接口。
-
-在 `.env` 里配置 R2 和网页登录信息；`PADDLEOCR_TOKEN` 仅用于命令行转换的默认 Token：
+在 `.env` 里配置 PaddleOCR、R2 和网页登录信息。网页和命令行都会使用 `PADDLEOCR_TOKEN` 与 `PADDLEOCR_MODEL`，上传页面不会传递或展示 PaddleOCR API Key。
 
 ```text
 PADDLEOCR_TOKEN=你的PaddleOCR Token
+PADDLEOCR_MODEL=PaddleOCR-VL-1.6
 
 WEB_USERNAME=admin
 WEB_PASSWORD=换成强密码
@@ -77,6 +76,7 @@ nano .env
 
 ```text
 PADDLEOCR_TOKEN=你的PaddleOCR Token
+PADDLEOCR_MODEL=PaddleOCR-VL-1.6
 WEB_USERNAME=admin
 WEB_PASSWORD=换成强密码
 R2_ACCOUNT_ID=你的Cloudflare账户ID
