@@ -12,6 +12,14 @@ import requests
 
 JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 DEFAULT_MODEL = "PaddleOCR-VL-1.6"
+SUPPORTED_INPUT_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -93,6 +101,18 @@ def slugify_filename(name: str) -> str:
     return stem or "document"
 
 
+def get_input_content_type(file_name: str) -> str:
+    extension = Path(file_name).suffix.lower()
+    content_type = SUPPORTED_INPUT_CONTENT_TYPES.get(extension)
+    if not content_type:
+        supported = ", ".join(sorted(SUPPORTED_INPUT_CONTENT_TYPES))
+        raise PaddleOcrError(
+            f"Unsupported input format: {extension or 'no file extension'}. "
+            f"Supported formats: {supported}"
+        )
+    return content_type
+
+
 def submit_job(
     file_path: str,
     token: str,
@@ -122,13 +142,14 @@ def submit_job(
             "model": model,
             "optionalPayload": json.dumps(optional_payload, ensure_ascii=False),
         }
+        content_type = get_input_content_type(path.name)
         with path.open("rb") as file_obj:
             response = request_with_retries(
                 "POST",
                 JOB_URL,
                 headers=headers,
                 data=data,
-                files={"file": file_obj},
+                files={"file": (path.name, file_obj, content_type)},
                 timeout=300,
             )
 
@@ -276,9 +297,12 @@ def save_results(jsonl_url: str, output_dir: Path, combined_md: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert a local PDF or file URL to Markdown with PaddleOCR."
+        description=(
+            "Convert a local PDF, JPG, PNG, TIFF, or file URL to Markdown "
+            "with PaddleOCR."
+        )
     )
-    parser.add_argument("input", help="Local PDF path or file URL")
+    parser.add_argument("input", help="Local file path or file URL")
     parser.add_argument(
         "--output-dir",
         default="output",

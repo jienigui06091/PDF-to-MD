@@ -67,6 +67,22 @@ function Get-SafeFileName {
     return $safe
 }
 
+function Get-InputContentType {
+    param([string]$Path)
+
+    switch ([System.IO.Path]::GetExtension($Path).ToLowerInvariant()) {
+        ".pdf" { return "application/pdf" }
+        ".jpg" { return "image/jpeg" }
+        ".jpeg" { return "image/jpeg" }
+        ".png" { return "image/png" }
+        ".tif" { return "image/tiff" }
+        ".tiff" { return "image/tiff" }
+        default {
+            throw "Unsupported input format. Supported formats: .pdf, .jpg, .jpeg, .png, .tif, .tiff"
+        }
+    }
+}
+
 function Get-SafeOutputPath {
     param(
         [string]$Root,
@@ -127,7 +143,7 @@ function Submit-PaddleJob {
 
         $stream = [System.IO.File]::OpenRead($PathOrUrl)
         $fileContent = [System.Net.Http.StreamContent]::new($stream)
-        $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("application/pdf")
+        $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse((Get-InputContentType -Path $PathOrUrl))
         $form.Add($fileContent, "file", [System.IO.Path]::GetFileName($PathOrUrl))
 
         $httpResponse = $client.PostAsync($JobUrl, $form).Result

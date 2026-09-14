@@ -1,6 +1,6 @@
 # PDF to Markdown with PaddleOCR
 
-这个目录里放的是一个 PaddleOCR 云端 OCR 转 Markdown 工具，适合扫描版 PDF、图片型 PDF、影印书。
+这个目录里放的是一个 PaddleOCR 云端 OCR 转 Markdown 工具，支持 PDF、JPG/JPEG、PNG 和 TIFF，适合扫描版 PDF、图片型 PDF、影印书和文档图片。
 
 ## 网页上传
 
@@ -16,7 +16,7 @@
 http://127.0.0.1:8765
 ```
 
-页面上传 PDF 后会在后台转换，完成后可下载合并后的 Markdown，也可以查看分页 Markdown 和图片。网页转换产生的 Markdown、分页文件和图片会直接上传到 Cloudflare R2，不会写入本地输出目录。上传的原始 PDF 仅在系统临时目录中停留到 PaddleOCR 接收完成，之后立即删除。
+页面上传 PDF 或图片后会在后台转换，完成后可下载合并后的 Markdown，也可以查看分页 Markdown 和图片。网页转换产生的 Markdown、分页文件和图片会直接上传到 Cloudflare R2，不会写入本地输出目录。上传的原始文件仅在系统临时目录中停留到 PaddleOCR 接收完成，之后立即删除。
 
 在 `.env` 里配置 PaddleOCR、R2 和网页登录信息。网页和命令行都会使用 `PADDLEOCR_TOKEN` 与 `PADDLEOCR_MODEL`，上传页面不会传递或展示 PaddleOCR API Key。
 
@@ -152,11 +152,13 @@ $env:PADDLEOCR_TOKEN="你的PaddleOCR Token"
 
 环境变量优先级高于 `.env`。
 
-### 3. 转换你的 PDF
+### 3. 转换你的 PDF 或图片
 
 ```powershell
 & "C:\yourpath\python.exe" .\paddle_pdf_to_md.py "C:\yourpath\xxx.pdf" --output-dir ".\output\charlie22"
 ```
+
+本地输入支持 `.pdf`、`.jpg`、`.jpeg`、`.png`、`.tif` 和 `.tiff`。
 
 输出内容：
 

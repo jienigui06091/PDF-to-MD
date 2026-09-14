@@ -1,12 +1,19 @@
 import unittest
 from datetime import datetime, timezone
+from io import BytesIO
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from paddle_pdf_to_md import get_model
+from paddle_pdf_to_md import PaddleOcrError, get_input_content_type, get_model
 from web_app import (
+    MultipartFormError,
+    get_upload_suffix,
     jobs,
     jobs_lock,
+    markdown_to_html,
+    markdown_to_text,
+    parse_uploaded_document,
     render_home,
     restore_jobs_from_r2,
     save_results_to_r2,
@@ -79,6 +86,67 @@ class SaveResultsToR2Tests(unittest.TestCase):
             combined,
         )
 
+    def test_html_and_text_combined_outputs_are_generated(self) -> None:
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "# Heading\n\n![scan](imgs/scan.png)",
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+        storage = FakeStorage()
+
+        with patch(
+            "web_app.iter_jsonl_results", side_effect=lambda _: iter(results)
+        ):
+            _, _, html_key = save_results_to_r2(
+                "https://source/results.jsonl",
+                storage,
+                "pdf-to-md/job_html",
+                "document.html",
+                "html",
+            )
+            _, _, text_key = save_results_to_r2(
+                "https://source/results.jsonl",
+                storage,
+                "pdf-to-md/job_text",
+                "document.txt",
+                "text",
+            )
+
+        self.assertIn("<h1>Heading</h1>", storage.uploads[html_key][0].decode("utf-8"))
+        self.assertEqual(storage.uploads[html_key][1], "text/html; charset=utf-8")
+        self.assertIn("Heading", storage.uploads[text_key][0].decode("utf-8"))
+        self.assertEqual(storage.uploads[text_key][1], "text/plain; charset=utf-8")
+
+
+class OutputRenderingTests(unittest.TestCase):
+    def test_html_escapes_source_markup(self) -> None:
+        html_output = markdown_to_html("# Hello\n\n<script>alert(1)</script>")
+
+        self.assertIn("<h1>Hello</h1>", html_output)
+        self.assertIn("&lt;script&gt;", html_output)
+
+    def test_plain_text_removes_markdown_syntax(self) -> None:
+        self.assertEqual(markdown_to_text("# Title\n\n**Bold**"), "Title\n\nBold\n")
+
+    def test_plain_text_extracts_visible_text_from_html_tables(self) -> None:
+        text = markdown_to_text(
+            "<table><tr><th>Name</th><th>Age</th></tr>"
+            "<tr><td>Alice</td><td>30</td></tr></table>"
+        )
+
+        self.assertEqual(text, "Name Age\nAlice 30\n")
+        self.assertNotIn("<", text)
+        self.assertNotIn(">", text)
+
 
 class PaddleOcrConfigurationTests(unittest.TestCase):
     def test_model_uses_environment_configuration(self) -> None:
@@ -91,6 +159,63 @@ class PaddleOcrConfigurationTests(unittest.TestCase):
         self.assertNotIn('name="api_key"', page)
         self.assertNotIn('name="model"', page)
         self.assertNotIn("/api/models", page)
+
+    def test_image_input_formats_have_expected_mime_types(self) -> None:
+        self.assertEqual(get_input_content_type("photo.JPG"), "image/jpeg")
+        self.assertEqual(get_input_content_type("scan.png"), "image/png")
+        self.assertEqual(get_input_content_type("archive.TIFF"), "image/tiff")
+        self.assertEqual(get_upload_suffix("report.pdf"), ".pdf")
+        self.assertEqual(get_upload_suffix("photo.jpg"), ".jpg")
+
+    def test_unsupported_input_format_is_rejected(self) -> None:
+        with self.assertRaisesRegex(PaddleOcrError, "Unsupported input format"):
+            get_input_content_type("document.docx")
+
+
+class MultipartUploadTests(unittest.TestCase):
+    def test_upload_parser_streams_file_and_preserves_form_values(self) -> None:
+        boundary = "----TestBoundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="document"; filename="scan.jpg"\r\n'
+            "Content-Type: image/jpeg\r\n"
+            "\r\n"
+        ).encode() + b"image-bytes\r\n" + (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="name"\r\n'
+            "\r\n"
+            "my output\r\n"
+            f"--{boundary}--\r\n"
+        ).encode()
+
+        with TemporaryDirectory() as temp_dir:
+            upload = parse_uploaded_document(
+                BytesIO(body),
+                f"multipart/form-data; boundary={boundary}",
+                temp_dir,
+            )
+            self.assertEqual(upload.filename, "scan.jpg")
+            self.assertEqual(upload.fields["name"], "my output")
+            self.assertEqual(upload.input_path.read_bytes(), b"image-bytes")
+            upload.input_path.unlink()
+
+    def test_empty_upload_is_rejected(self) -> None:
+        boundary = "----TestBoundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="document"; filename="empty.jpg"\r\n'
+            "Content-Type: image/jpeg\r\n"
+            "\r\n"
+            f"\r\n--{boundary}--\r\n"
+        ).encode()
+
+        with TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(MultipartFormError, "empty"):
+                parse_uploaded_document(
+                    BytesIO(body),
+                    f"multipart/form-data; boundary={boundary}",
+                    temp_dir,
+                )
 
 
 class RestoreJobsFromR2Tests(unittest.TestCase):

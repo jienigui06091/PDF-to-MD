@@ -2,27 +2,31 @@ import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-import cgi
 import base64
 import html
 import json
 import mimetypes
 import os
-import shutil
+import re
 import sys
 import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
+from email.message import Message
+from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Optional
+from typing import Any, BinaryIO, Dict, Optional
 from urllib.parse import quote, unquote, urlparse
 
 from paddle_pdf_to_md import (
     JOB_URL,
     PaddleOcrError,
+    get_input_content_type,
     get_model,
     get_token,
     iter_jsonl_results,
@@ -40,6 +44,23 @@ ROOT = Path(__file__).resolve().parent
 MAX_UPLOAD_BYTES = 1024 * 1024 * 500
 WEB_USERNAME = os.environ.get("WEB_USERNAME") or read_dotenv_value("WEB_USERNAME") or ""
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD") or read_dotenv_value("WEB_PASSWORD") or ""
+OUTPUT_FORMATS = {
+    "markdown": {
+        "extension": ".md",
+        "content_type": "text/markdown; charset=utf-8",
+        "label": "Markdown (.md)",
+    },
+    "html": {
+        "extension": ".html",
+        "content_type": "text/html; charset=utf-8",
+        "label": "HTML (.html)",
+    },
+    "text": {
+        "extension": ".txt",
+        "content_type": "text/plain; charset=utf-8",
+        "label": "Plain text (.txt)",
+    },
+}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -128,19 +149,28 @@ def restore_jobs_from_r2(storage: Optional[R2Storage] = None) -> int:
             candidate_id = uuid.uuid5(uuid.NAMESPACE_URL, folder).hex[:12]
             output_stem = folder
 
-        root_markdown = sorted(
+        root_outputs = sorted(
             (
                 item
                 for item in folder_objects
                 if "/" not in item["relative"]
-                and item["relative"].lower().endswith(".md")
+                and get_output_format_from_filename(item["relative"]) is not None
             ),
             key=lambda item: (
-                item["relative"] != f"{output_stem}.md",
+                item["relative"]
+                != (
+                    f"{output_stem}"
+                    f"{OUTPUT_FORMATS[get_output_format_from_filename(item['relative'])]['extension']}"
+                ),
                 item["relative"].lower(),
             ),
         )
-        combined_item = root_markdown[0] if root_markdown else None
+        combined_item = root_outputs[0] if root_outputs else None
+        output_format = (
+            get_output_format_from_filename(combined_item["relative"])
+            if combined_item
+            else "markdown"
+        )
         page_count = sum(
             1
             for item in folder_objects
@@ -172,6 +202,7 @@ def restore_jobs_from_r2(storage: Optional[R2Storage] = None) -> int:
             "status": status,
             "message": message,
             "r2_prefix": f"{base_prefix}{folder}",
+            "output_format": output_format,
             "combined_name": combined_item["relative"] if combined_item else "",
             "combined_key": combined_item["key"] if combined_item else "",
             "page_count": page_count,
@@ -197,6 +228,415 @@ def format_size(size: int) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{size} B"
+
+
+def get_upload_suffix(file_name: str) -> str:
+    get_input_content_type(file_name)
+    return Path(file_name).suffix.lower()
+
+
+def get_output_format(value: str) -> str:
+    return value if value in OUTPUT_FORMATS else "markdown"
+
+
+def get_output_format_from_filename(file_name: str) -> Optional[str]:
+    extension = Path(file_name).suffix.lower()
+    for output_format, details in OUTPUT_FORMATS.items():
+        if details["extension"] == extension:
+            return output_format
+    return None
+
+
+def render_markdown_inline(value: str) -> str:
+    escaped = html.escape(value, quote=True)
+    escaped = re.sub(
+        r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)",
+        r'<img src="\2" alt="\1">',
+        escaped,
+    )
+    escaped = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r'<a href="\2">\1</a>', escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", escaped)
+    return escaped
+
+
+def markdown_to_html(markdown: str) -> str:
+    lines = re.sub(r"<!--.*?-->", "", markdown, flags=re.DOTALL).splitlines()
+    parts = [
+        "<!doctype html>",
+        '<html lang="zh-CN">',
+        '<head><meta charset="utf-8"><title>OCR output</title></head>',
+        "<body>",
+    ]
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        if line.startswith("```"):
+            language = line.removeprefix("```").strip()
+            code_lines = []
+            index += 1
+            while index < len(lines) and not lines[index].startswith("```"):
+                code_lines.append(lines[index])
+                index += 1
+            class_name = (
+                f' class="language-{html.escape(language, quote=True)}"'
+                if language
+                else ""
+            )
+            code = html.escape("\n".join(code_lines))
+            parts.append(f"<pre><code{class_name}>{code}</code></pre>")
+            index += 1
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading:
+            level = len(heading.group(1))
+            parts.append(f"<h{level}>{render_markdown_inline(heading.group(2))}</h{level}>")
+            index += 1
+            continue
+
+        list_match = re.match(r"^[-*+]\s+(.*)$", line)
+        ordered_match = re.match(r"^\d+\.\s+(.*)$", line)
+        if list_match or ordered_match:
+            tag = "ol" if ordered_match else "ul"
+            items = []
+            while index < len(lines):
+                match = (
+                    re.match(r"^\d+\.\s+(.*)$", lines[index])
+                    if tag == "ol"
+                    else re.match(r"^[-*+]\s+(.*)$", lines[index])
+                )
+                if not match:
+                    break
+                items.append(f"<li>{render_markdown_inline(match.group(1))}</li>")
+                index += 1
+            parts.append(f"<{tag}>{''.join(items)}</{tag}>")
+            continue
+
+        paragraph = [line]
+        index += 1
+        while index < len(lines) and lines[index].strip():
+            if re.match(r"^(#{1,6})\s+|^[-*+]\s+|^\d+\.\s+|^```", lines[index]):
+                break
+            paragraph.append(lines[index])
+            index += 1
+        rendered_lines = "<br>".join(render_markdown_inline(item) for item in paragraph)
+        parts.append(f"<p>{rendered_lines}</p>")
+
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+class VisibleTextParser(HTMLParser):
+    BLOCK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "div",
+        "dl",
+        "dt",
+        "dd",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "thead",
+        "tfoot",
+        "ul",
+    }
+    HIDDEN_TAGS = {"script", "style"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.hidden_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self.HIDDEN_TAGS:
+            self.hidden_depth += 1
+            return
+        if self.hidden_depth:
+            return
+        if tag == "br" or tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.HIDDEN_TAGS:
+            self.hidden_depth = max(0, self.hidden_depth - 1)
+            return
+        if self.hidden_depth:
+            return
+        if tag in {"td", "th"}:
+            self.parts.append(" ")
+        elif tag in self.BLOCK_TAGS or tag == "tr":
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden_depth:
+            self.parts.append(data)
+
+    def get_text(self) -> str:
+        text = "".join(self.parts)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text
+
+
+def markdown_to_text(markdown: str) -> str:
+    text = re.sub(r"<!--.*?-->", "", markdown, flags=re.DOTALL)
+    text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1: \2", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1: \2", text)
+    text = re.sub(r"(?m)^#{1,6}\s+", "", text)
+    text = re.sub(r"(?m)^>\s?", "", text)
+    text = re.sub(r"`{1,3}", "", text)
+    text = re.sub(r"(\*\*|__|\*|_|~~)", "", text)
+
+    parser = VisibleTextParser()
+    parser.feed(text)
+    parser.close()
+    return parser.get_text().strip() + "\n"
+
+
+def render_output(markdown: str, output_format: str) -> tuple[bytes, str]:
+    normalized_format = get_output_format(output_format)
+    details = OUTPUT_FORMATS[normalized_format]
+    if normalized_format == "html":
+        content = markdown_to_html(markdown)
+    elif normalized_format == "text":
+        content = markdown_to_text(markdown)
+    else:
+        content = markdown
+    return content.encode("utf-8"), details["content_type"]
+
+
+class MultipartFormError(ValueError):
+    pass
+
+
+@dataclass
+class UploadedDocument:
+    fields: Dict[str, str]
+    filename: str
+    input_path: Path
+    input_size: int
+
+
+class MultipartReader:
+    def __init__(self, stream: BinaryIO, boundary: bytes) -> None:
+        self.stream = stream
+        self.boundary = boundary
+        self.delimiter = b"\r\n--" + boundary
+        self.buffer = bytearray()
+
+    def fill(self) -> bool:
+        read_available = getattr(self.stream, "read1", None)
+        chunk = (
+            read_available(64 * 1024)
+            if callable(read_available)
+            else self.stream.read(64 * 1024)
+        )
+        if not chunk:
+            return False
+        self.buffer.extend(chunk)
+        return True
+
+    def read_line(self, limit: int = 16 * 1024) -> bytes:
+        while True:
+            line_end = self.buffer.find(b"\n")
+            if line_end >= 0:
+                line = bytes(self.buffer[: line_end + 1])
+                del self.buffer[: line_end + 1]
+                return line
+            if len(self.buffer) > limit:
+                raise MultipartFormError("Multipart header is too large")
+            if not self.fill():
+                raise MultipartFormError("Unexpected end of multipart body")
+
+    def read_headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        while True:
+            line = self.read_line()
+            if line in {b"\r\n", b"\n"}:
+                return headers
+            if b":" not in line:
+                raise MultipartFormError("Invalid multipart header")
+            name, value = line.rstrip(b"\r\n").split(b":", 1)
+            headers[name.decode("ascii", "strict").lower()] = value.lstrip().decode(
+                "latin-1"
+            )
+
+    def read_part(self, output: BinaryIO, max_size: Optional[int] = None) -> bool:
+        written = 0
+        keep = len(self.delimiter) + 2
+
+        while True:
+            index = self.buffer.find(self.delimiter)
+            if index >= 0:
+                delimiter_end = index + len(self.delimiter)
+                while len(self.buffer) < delimiter_end + 2:
+                    if not self.fill():
+                        raise MultipartFormError("Invalid multipart boundary")
+                suffix = bytes(self.buffer[delimiter_end : delimiter_end + 2])
+                if suffix in {b"\r\n", b"--"}:
+                    chunk = bytes(self.buffer[:index])
+                    output.write(chunk)
+                    written += len(chunk)
+                    if max_size is not None and written > max_size:
+                        raise MultipartFormError("Multipart field is too large")
+                    del self.buffer[: delimiter_end + 2]
+
+                    if suffix == b"--":
+                        if len(self.buffer) < 2:
+                            self.fill()
+                        if self.buffer[:2] == b"\r\n":
+                            del self.buffer[:2]
+                        return True
+                    return False
+
+                output.write(bytes(self.buffer[: index + 1]))
+                written += index + 1
+                if max_size is not None and written > max_size:
+                    raise MultipartFormError("Multipart field is too large")
+                del self.buffer[: index + 1]
+                continue
+
+            if len(self.buffer) > keep:
+                chunk = bytes(self.buffer[:-keep])
+                output.write(chunk)
+                written += len(chunk)
+                if max_size is not None and written > max_size:
+                    raise MultipartFormError("Multipart field is too large")
+                del self.buffer[:-keep]
+
+            if not self.fill():
+                raise MultipartFormError("Unexpected end of multipart body")
+
+
+def get_multipart_boundary(content_type: str) -> bytes:
+    message = Message()
+    message["Content-Type"] = content_type
+    if message.get_content_type() != "multipart/form-data":
+        raise MultipartFormError("Expected multipart/form-data")
+
+    boundary = message.get_param("boundary", header="content-type")
+    if not isinstance(boundary, str) or not boundary:
+        raise MultipartFormError("Missing multipart boundary")
+    try:
+        return boundary.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise MultipartFormError("Invalid multipart boundary") from exc
+
+
+def get_content_disposition_params(value: str) -> Dict[str, str]:
+    message = Message()
+    message["Content-Disposition"] = value
+    params = message.get_params(header="content-disposition", unquote=True)
+    if not params or params[0][0].lower() != "form-data":
+        raise MultipartFormError("Invalid multipart content disposition")
+    return {
+        str(name).lower(): str(param_value)
+        for name, param_value in params[1:]
+        if param_value is not None
+    }
+
+
+def decode_multipart_filename(value: str) -> str:
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return value
+
+
+def parse_uploaded_document(
+    stream: BinaryIO, content_type: str, temp_dir: Optional[str] = None
+) -> UploadedDocument:
+    reader = MultipartReader(stream, get_multipart_boundary(content_type))
+    first_boundary = reader.read_line()
+    if first_boundary.rstrip(b"\r\n") != b"--" + reader.boundary:
+        raise MultipartFormError("Invalid multipart body")
+
+    fields: Dict[str, str] = {}
+    document_path: Optional[Path] = None
+    document_name = ""
+    document_size = 0
+
+    try:
+        while True:
+            headers = reader.read_headers()
+            disposition = headers.get("content-disposition", "")
+            params = get_content_disposition_params(disposition)
+            field_name = params.get("name")
+            if not field_name:
+                raise MultipartFormError("Multipart field has no name")
+
+            filename = params.get("filename")
+            if filename is not None:
+                if field_name != "document" or document_path is not None:
+                    raise MultipartFormError("Expected exactly one document file")
+
+                document_name = Path(decode_multipart_filename(filename)).name
+                if not document_name:
+                    raise MultipartFormError("Missing document file")
+                suffix = Path(document_name).suffix.lower()
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix="document-to-md-upload-",
+                    suffix=suffix,
+                    delete=False,
+                    dir=temp_dir,
+                ) as output:
+                    document_path = Path(output.name)
+                    is_final = reader.read_part(output)
+                    document_size = output.tell()
+            else:
+                output = BytesIO()
+                is_final = reader.read_part(output, max_size=64 * 1024)
+                fields[field_name] = output.getvalue().decode("utf-8", "replace")
+
+            if is_final:
+                break
+    except Exception:
+        if document_path:
+            document_path.unlink(missing_ok=True)
+        raise
+
+    if document_path is None:
+        raise MultipartFormError("Missing document file")
+    if document_size <= 0:
+        document_path.unlink(missing_ok=True)
+        raise MultipartFormError("Uploaded document is empty")
+
+    return UploadedDocument(
+        fields=fields,
+        filename=document_name,
+        input_path=document_path,
+        input_size=document_size,
+    )
 
 
 def poll_paddle_result_url(job_id: str, token: str, paddle_job_id: str) -> str:
@@ -250,6 +690,7 @@ def save_results_to_r2(
     storage: R2Storage,
     object_prefix: str,
     combined_name: str,
+    output_format: str = "markdown",
 ) -> tuple[int, list[dict[str, Any]], str]:
     objects: dict[str, dict[str, Any]] = {}
     combined_parts: list[str] = []
@@ -301,10 +742,13 @@ def save_results_to_r2(
         raise PaddleOcrError("No layoutParsingResults found in OCR result")
 
     combined_relative = safe_relative_key(combined_name)
+    combined_content, combined_content_type = render_output(
+        "".join(combined_parts), output_format
+    )
     upload(
         combined_relative,
-        "".join(combined_parts).encode("utf-8"),
-        "text/markdown; charset=utf-8",
+        combined_content,
+        combined_content_type,
     )
     manifest = sorted(objects.values(), key=lambda item: item["relative"].lower())
     return page_num - 1, manifest, join_key(object_prefix, combined_relative)
@@ -328,7 +772,9 @@ def run_conversion(job_id: str) -> None:
             "useChartRecognition": bool(job.get("chart_recognition")),
         }
 
-        update_job(job_id, status="submitting", message="Uploading PDF to PaddleOCR")
+        update_job(
+            job_id, status="submitting", message="Uploading document to PaddleOCR"
+        )
         try:
             paddle_job_id = submit_job(
                 str(input_path),
@@ -352,6 +798,7 @@ def run_conversion(job_id: str) -> None:
             storage,
             job["r2_prefix"],
             job["combined_name"],
+            job.get("output_format", "markdown"),
         )
         update_job(
             job_id,
@@ -544,7 +991,7 @@ def render_page(title: str, body: str) -> bytes:
   </style>
 </head>
 <body>
-  <header><h1>PDF 转 Markdown</h1></header>
+  <header><h1>PDF / 图片转 Markdown</h1></header>
   <main>
     {''.join(notices)}
     {body}
@@ -580,14 +1027,22 @@ def render_home() -> bytes:
 
     body = f"""
     <section class="panel">
-      <h2>上传 PDF</h2>
+      <h2>上传文件</h2>
       <form id="upload-form" method="post" action="/upload" enctype="multipart/form-data">
-        <label for="pdf">选择 PDF 文件</label>
-        <input id="pdf" name="pdf" type="file" accept="application/pdf,.pdf" required>
+        <label for="document">选择 PDF 或图片</label>
+        <input id="document" name="document" type="file" accept="application/pdf,.pdf,image/jpeg,.jpg,.jpeg,image/png,.png,image/tiff,.tif,.tiff" required>
         <div class="row" style="margin-top:14px">
           <div>
             <label for="name">输出目录名</label>
             <input id="name" name="name" type="text" placeholder="留空则使用 PDF 文件名">
+          </div>
+          <div>
+            <label for="output_format">输出格式</label>
+            <select id="output_format" name="output_format">
+              <option value="markdown">Markdown (.md)</option>
+              <option value="html">HTML (.html)</option>
+              <option value="text">Plain text (.txt)</option>
+            </select>
           </div>
         </div>
         <div class="checks">
@@ -603,7 +1058,7 @@ def render_home() -> bytes:
       {jobs_table}
     </section>
     """
-    return render_page("PDF 转 Markdown", body)
+    return render_page("PDF / 图片转 Markdown", body)
 
 
 def render_job(job_id: str) -> bytes:
@@ -648,7 +1103,9 @@ def render_job(job_id: str) -> bytes:
         }}
         const links = document.getElementById('links');
         if (job.status === 'done') {{
-          links.innerHTML = '<a class="button" href="/download/' + encodeURIComponent(jobId) + '">下载 Markdown</a>' +
+          const outputLabels = {{markdown: 'Markdown', html: 'HTML', text: 'TXT'}};
+          const outputLabel = outputLabels[job.output_format] || 'output';
+          links.innerHTML = '<a class="button" href="/download/' + encodeURIComponent(jobId) + '">下载 ' + outputLabel + '</a>' +
             ' <a class="button secondary" href="/files/' + encodeURIComponent(jobId) + '/">查看输出文件</a>';
           return;
         }}
@@ -676,6 +1133,11 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             self.send_html(render_home())
+            return
+        if path == "/upload":
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/")
+            self.end_headers()
             return
         if path.startswith("/job/"):
             self.send_html(render_job(path.rsplit("/", 1)[-1]))
@@ -749,23 +1211,31 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
             return
 
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={
-                "REQUEST_METHOD": "POST",
-                "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-                "CONTENT_LENGTH": str(content_length),
-            },
-        )
-        file_field = form["pdf"] if "pdf" in form else None
-        if file_field is None or not getattr(file_field, "filename", ""):
-            self.send_error(HTTPStatus.BAD_REQUEST, "Missing PDF file")
+        try:
+            uploaded = parse_uploaded_document(
+                self.rfile, self.headers.get("Content-Type", "")
+            )
+        except MultipartFormError as exc:
+            self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except Exception as exc:
+            self.log_error("Unable to parse multipart upload: %s", exc)
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Unable to process upload")
             return
 
-        original_name = Path(file_field.filename).name
-        display_name = form.getfirst("name", "").strip()
+        original_name = uploaded.filename
+        upload_path = uploaded.input_path
+        input_size = uploaded.input_size
+        try:
+            input_suffix = get_upload_suffix(original_name)
+        except PaddleOcrError as exc:
+            upload_path.unlink(missing_ok=True)
+            self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, str(exc))
+            return
+        display_name = uploaded.fields.get("name", "").strip()
+        output_format = get_output_format(uploaded.fields.get("output_format", ""))
         if not get_token():
+            upload_path.unlink(missing_ok=True)
             self.send_error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 "Missing PaddleOCR token configuration",
@@ -776,22 +1246,7 @@ class WebHandler(BaseHTTPRequestHandler):
         job_id = uuid.uuid4().hex[:12]
         created_at = time.strftime("%Y-%m-%d %H:%M:%S")
         object_prefix = f"{storage.config.prefix}/{job_id}_{output_stem}"
-
-        upload_path: Optional[Path] = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                prefix=f"pdf-to-md-{job_id}-",
-                suffix=".pdf",
-                delete=False,
-            ) as output:
-                upload_path = Path(output.name)
-                shutil.copyfileobj(file_field.file, output)
-                input_size = output.tell()
-        except Exception:
-            if upload_path:
-                upload_path.unlink(missing_ok=True)
-            raise
+        output_details = OUTPUT_FORMATS[output_format]
 
         with jobs_lock:
             jobs[job_id] = {
@@ -803,10 +1258,11 @@ class WebHandler(BaseHTTPRequestHandler):
                 "input_size": input_size,
                 "model": model,
                 "r2_prefix": object_prefix,
-                "combined_name": f"{output_stem}.md",
-                "doc_orientation": "doc_orientation" in form,
-                "doc_unwarping": "doc_unwarping" in form,
-                "chart_recognition": "chart_recognition" in form,
+                "output_format": output_format,
+                "combined_name": f"{output_stem}{output_details['extension']}",
+                "doc_orientation": "doc_orientation" in uploaded.fields,
+                "doc_unwarping": "doc_unwarping" in uploaded.fields,
+                "chart_recognition": "chart_recognition" in uploaded.fields,
                 "created_at": created_at,
                 "updated_at": created_at,
             }
@@ -905,7 +1361,7 @@ class WebHandler(BaseHTTPRequestHandler):
             filename = PurePosixPath(item["relative"]).name
             ascii_name = "".join(
                 char for char in filename if ord(char) < 128 and char not in '"\\'
-            ) or "document.md"
+            ) or "document"
             disposition = (
                 f'attachment; filename="{ascii_name}"; '
                 f"filename*=UTF-8''{quote(filename)}"
